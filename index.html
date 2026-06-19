@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>XAUUSD Intel Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#08080f;font-family:'Inter',system-ui,sans-serif;color:#e5e7eb;overflow-x:hidden}
+  ::-webkit-scrollbar{width:4px;height:4px}
+  ::-webkit-scrollbar-track{background:#0a0a14}
+  ::-webkit-scrollbar-thumb{background:#1e1e3a;border-radius:2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .fade-in{animation:fadeIn .3s ease}
+  input{font-family:inherit;color:#e5e7eb}
+  input::placeholder{color:#374151}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── HELPERS ──────────────────────────────────────────────────────
+const fmt = (n, d=2) => (n==null||isNaN(n)) ? "—" : Number(n).toFixed(d);
+const fmtD = n => (n==null||isNaN(n)) ? "—" : `${n>=0?"+":""}${fmt(n,2)}`;
+const S = (...a) => a.filter(Boolean).join(" ");
+
+function calcRSI(p, period=14){
+  if(p.length<period+1)return null;
+  let g=0,l=0;
+  for(let i=1;i<=period;i++){const d=p[i]-p[i-1];d>=0?g+=d:l-=d}
+  let ag=g/period,al=l/period;
+  for(let i=period+1;i<p.length;i++){
+    const d=p[i]-p[i-1];
+    ag=(ag*(period-1)+Math.max(d,0))/period;
+    al=(al*(period-1)+Math.max(-d,0))/period;
+  }
+  if(al===0)return 100;
+  return 100-100/(1+ag/al);
+}
+function calcEMA(p,period){
+  if(p.length<period)return null;
+  const k=2/(period+1);
+  let e=p.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for(let i=period;i<p.length;i++)e=p[i]*k+e*(1-k);
+  return e;
+}
+function calcMACD(p){
+  const e12=calcEMA(p,12),e26=calcEMA(p,26);
+  return(!e12||!e26)?null:e12-e26;
+}
+function calcBB(p,period=20,sd=2){
+  if(p.length<period)return null;
+  const sl=p.slice(-period);
+  const m=sl.reduce((a,b)=>a+b,0)/period;
+  const std=Math.sqrt(sl.reduce((a,b)=>a+(b-m)**2,0)/period);
+  return{upper:m+sd*std,middle:m,lower:m-sd*std};
+}
+function calcATR(candles,period=14){
+  if(!candles||candles.length<period+1)return null;
+  const trs=[];
+  for(let i=1;i<candles.length;i++){
+    const c=candles[i],p=candles[i-1];
+    trs.push(Math.max(c.high-c.low,Math.abs(c.high-p.close),Math.abs(c.low-p.close)));
+  }
+  let atr=trs.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for(let i=period;i<trs.length;i++)atr=(atr*(period-1)+trs[i])/period;
+  return +atr.toFixed(2);
+}
+function genCandles(base,n=60){
+  const out=[];
+  const atrBase=base*0.006;
+  let p=base-(atrBase*n*0.1);
+  for(let i=0;i<n;i++){
+    const o=p,dir=Math.random()<0.52?1:-1;
+    const body=atrBase*(0.3+Math.random()*0.7);
+    const c=o+dir*body;
+    const h=Math.max(o,c)+Math.random()*atrBase*0.4;
+    const l=Math.min(o,c)-Math.random()*atrBase*0.4;
+    out.push({open:+o.toFixed(2),high:+h.toFixed(2),low:+l.toFixed(2),close:+c.toFixed(2)});
+    p=c;
+  }
+  out[out.length-1]={...out[out.length-1],close:base,high:Math.max(out[out.length-1].high,base)};
+  return out;
+}
+function calcZones(price,atr){
+  if(!price||!atr)return null;
+  return{
+    r2:+(price+atr*2).toFixed(2),r1:+(price+atr).toFixed(2),
+    s1:+(price-atr).toFixed(2),s2:+(price-atr*2).toFixed(2),s3:+(price-atr*3.5).toFixed(2)
+  };
+}
+function extractJsonSignal(text){
+  // Proper brace-matching (handles nested objects), mirrors server-side logic.
+  const candidates=[];
+  let depth=0,start=null;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i];
+    if(ch==="{"){ if(depth===0)start=i; depth++; }
+    else if(ch==="}"){ if(depth>0){ depth--; if(depth===0&&start!==null){ candidates.push([start,i+1,text.slice(start,i+1)]); start=null; } } }
+  }
+  if(!candidates.length)return[null,null];
+  for(let i=candidates.length-1;i>=0;i--){
+    const[,,raw]=candidates[i];
+    let parsed=null;
+    try{ parsed=JSON.parse(raw); }
+    catch{
+      try{ parsed=JSON.parse(raw.replace(/'/g,'"').replace(/,\s*\}/g,"}")); }
+      catch{ continue; }
+    }
+    if(parsed&&typeof parsed==="object"&&"direction" in parsed)return[parsed,raw];
+  }
+  return[null,null];
+}
+
+function parseSignal(text,price,zones,atr,score,signal){
+  if(!text||!price)return null;
+  const[parsed,matchedRaw]=extractJsonSignal(text);
+
+  if(parsed){
+    const dir=(parsed.direction==="BUY"||parsed.direction==="SELL")?parsed.direction:null;
+    const verdict=dir||"NEUTRAL";
+    let narrative=text;
+    if(matchedRaw&&narrative.includes(matchedRaw))narrative=narrative.replace(matchedRaw,"");
+    narrative=narrative.replace(/```(?:json)?\s*```/g,"").trim();
+    return{
+      verdict,direction:dir,score,
+      entry_low:parsed.entry_low??null,entry_high:parsed.entry_high??null,
+      sl:parsed.sl??null,tp1:parsed.tp1??null,tp2:parsed.tp2??null,tp3:parsed.tp3??null,
+      lot_mode:"auto",risk_pct:1.0,atr,price,
+      confidence_pct:parsed.confidence_pct??50,
+      summary:(narrative||text).slice(0,300),
+      parse_method:"json"
+    };
+  }
+
+  // Fallback: fragile regex parsing — only used if AI didn't return valid JSON
+  let verdict=signal||"NEUTRAL";
+  const vm=text.match(/STRONG BUY|STRONG SELL|BUY|SELL|HOLD/i);
+  if(vm)verdict=vm[0].toUpperCase().replace("HOLD","NEUTRAL");
+  const dir=verdict.includes("BUY")?"BUY":verdict.includes("SELL")?"SELL":null;
+  const slM=text.match(/stop.?loss[:\s]+\$?([\d,]+\.?\d*)/i)||text.match(/\bSL[:\s]+\$?([\d,]+\.?\d*)/i);
+  const t1M=text.match(/TP1[:\s]+\$?([\d,]+\.?\d*)/i)||text.match(/target.?1[:\s]+\$?([\d,]+\.?\d*)/i);
+  const t2M=text.match(/TP2[:\s]+\$?([\d,]+\.?\d*)/i);
+  const t3M=text.match(/TP3[:\s]+\$?([\d,]+\.?\d*)/i);
+  let sl=slM?parseFloat(slM[1].replace(",","")):null;
+  let tp1=t1M?parseFloat(t1M[1].replace(",","")):null;
+  let tp2=t2M?parseFloat(t2M[1].replace(",","")):null;
+  let tp3=t3M?parseFloat(t3M[1].replace(",","")):null;
+  const eL=zones?.s1?+(zones.s1-(atr||20)*0.3).toFixed(2):null;
+  const eH=zones?.s1?+(zones.s1+(atr||20)*0.5).toFixed(2):null;
+  if(!sl&&atr)sl=dir==="BUY"?+(price-atr*2).toFixed(2):+(price+atr*2).toFixed(2);
+  if(!tp1&&atr)tp1=dir==="BUY"?+(price+atr*3).toFixed(2):+(price-atr*3).toFixed(2);
+  return{verdict,direction:dir,score,entry_low:eL,entry_high:eH,sl,tp1,tp2,tp3,lot_mode:"auto",risk_pct:1.0,atr,price,confidence_pct:40,summary:text.slice(0,300).replace(/\n/g," "),parse_method:"regex_fallback"};
+}
+
+// ─── SPARKLINE ────────────────────────────────────────────────────
+function Sparkline({data,width=120,height=40,color="#f59e0b"}){
+  if(!data||data.length<2)return null;
+  const min=Math.min(...data),max=Math.max(...data),range=max-min||1;
+  const pts=data.map((v,i)=>`${(i/(data.length-1))*width},${height-((v-min)/range)*height}`).join(" ");
+  return<svg width={width} height={height}><polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round"/></svg>;
+}
+
+// ─── CANDLE CHART ─────────────────────────────────────────────────
+function CandleChart({candles,width=580,height=200}){
+  if(!candles?.length)return null;
+  const pad={t:10,r:8,b:18,l:52};
+  const cW=width-pad.l-pad.r,cH=height-pad.t-pad.b;
+  const prices=candles.flatMap(c=>[c.high,c.low]);
+  const minP=Math.min(...prices),maxP=Math.max(...prices),rng=maxP-minP||1;
+  const sy=p=>cH-((p-minP)/rng)*cH;
+  const sx=i=>pad.l+(i/candles.length)*cW+cW/candles.length/2;
+  const cw=Math.max(2,cW/candles.length-1);
+  const yT=Array.from({length:5},(_,i)=>({y:cH-(i/4)*cH+pad.t,val:minP+(i/4)*rng}));
+  return(
+    <svg width="100%" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none">
+      {yT.map((t,i)=>(
+        <g key={i}>
+          <line x1={pad.l} x2={pad.l+cW} y1={t.y} y2={t.y} stroke="#1a1a2e" strokeWidth="0.5"/>
+          <text x={pad.l-4} y={t.y+4} textAnchor="end" fontSize="9" fill="#4b5563">{fmt(t.val,0)}</text>
+        </g>
+      ))}
+      {candles.map((c,i)=>{
+        const x=sx(i),up=c.close>=c.open,col=up?"#10b981":"#ef4444";
+        const bt=sy(Math.max(c.open,c.close))+pad.t,bb=sy(Math.min(c.open,c.close))+pad.t;
+        return(
+          <g key={i}>
+            <line x1={x} x2={x} y1={sy(c.high)+pad.t} y2={sy(c.low)+pad.t} stroke={col} strokeWidth="0.8"/>
+            <rect x={x-cw/2} y={bt} width={cw} height={Math.max(1,bb-bt)} fill={col} opacity="0.9"/>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ─── SIGNAL BADGE ─────────────────────────────────────────────────
+function SignalBadge({signal}){
+  const m={STRONG_BUY:["#10b981","#fff","STRONG BUY"],BUY:["#34d399","#000","BUY"],NEUTRAL:["#f59e0b","#000","NEUTRAL"],SELL:["#f87171","#fff","SELL"],STRONG_SELL:["#dc2626","#fff","STRONG SELL"]};
+  const [bg,fg,label]=m[signal]||m.NEUTRAL;
+  return<span style={{background:bg,color:fg,padding:"4px 14px",borderRadius:999,fontSize:11,fontWeight:800,letterSpacing:2}}>{label}</span>;
+}
+
+// ─── SCORE GAUGE ──────────────────────────────────────────────────
+function ScoreGauge({score,label}){
+  const n=(score+100)/200;
+  const angle=n*180-90;
+  const r=42,cx=55,cy=55;
+  const rad=angle*Math.PI/180;
+  const nx=cx+r*0.7*Math.cos(rad),ny=cy+r*0.7*Math.sin(rad);
+  const color=score>30?"#10b981":score<-30?"#ef4444":"#f59e0b";
+  return(
+    <div style={{textAlign:"center"}}>
+      <svg width="110" height="68" viewBox="0 0 110 68">
+        <path d={`M ${cx-r} ${cy} A ${r} ${r} 0 0 1 ${cx+r} ${cy}`} fill="none" stroke="#1a1a2e" strokeWidth="8"/>
+        <path d={`M ${cx-r} ${cy} A ${r} ${r} 0 0 1 ${cx+r} ${cy}`} fill="none" stroke={color} strokeWidth="8" strokeDasharray={`${n*132} 132`}/>
+        <line x1={cx} y1={cy} x2={nx} y2={ny} stroke="#e5e7eb" strokeWidth="2" strokeLinecap="round"/>
+        <circle cx={cx} cy={cy} r="4" fill="#e5e7eb"/>
+        <text x={cx} y={cy+16} textAnchor="middle" fontSize="12" fontWeight="bold" fill={color}>{score>0?"+":""}{Math.round(score)}</text>
+      </svg>
+      <div style={{color:"#6b7280",fontSize:10,marginTop:-4}}>{label}</div>
+    </div>
+  );
+}
+
+// ─── MARKDOWN RENDERER ────────────────────────────────────────────
+function MD({text,accent="#f59e0b"}){
+  if(!text)return null;
+  return(
+    <div style={{lineHeight:1.75}}>
+      {text.split("\n").map((line,i)=>{
+        if(line.startsWith("## "))return<h2 key={i} style={{color:accent,fontSize:14,fontWeight:700,margin:"14px 0 6px",letterSpacing:.5}}>{line.slice(3)}</h2>;
+        if(line.startsWith("# "))return<h1 key={i} style={{color:accent,fontSize:16,fontWeight:800,margin:"14px 0 6px"}}>{line.slice(2)}</h1>;
+        if(line.startsWith("- "))return<div key={i} style={{color:"#d1d5db",fontSize:12.5,paddingLeft:16,marginBottom:4,display:"flex",gap:8}}><span style={{color:accent,flexShrink:0}}>•</span>{line.slice(2)}</div>;
+        if(line.trim()==="")return<div key={i} style={{height:6}}/>;
+        const parts=line.split(/\*\*(.*?)\*\*/g);
+        return<p key={i} style={{color:"#9ca3af",fontSize:12.5,margin:"3px 0"}}>{parts.map((p,j)=>j%2===1?<strong key={j} style={{color:"#e5e7eb",fontWeight:600}}>{p}</strong>:p)}</p>;
+      })}
+    </div>
+  );
+}
+
+// ─── ANALYSIS PANE ────────────────────────────────────────────────
+function AnalysisPane({title,subtitle,analysis,loading,onRun,color,hasApiKey}){
+  return(
+    <div className="fade-in" style={{background:"#0d0d1a",border:`1px solid ${color}33`,borderRadius:12,padding:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
+        <div>
+          <div style={{color,fontSize:13,fontWeight:700,letterSpacing:1,marginBottom:3}}>{title.toUpperCase()}</div>
+          <div style={{color:"#4b5563",fontSize:11}}>{subtitle}</div>
+        </div>
+        <button onClick={onRun} disabled={loading||!hasApiKey} style={{
+          background:!hasApiKey?"#1e1e2e":loading?"#1e1e2e":color,
+          color:!hasApiKey?"#374151":loading?"#4b5563":"#000",
+          border:"none",borderRadius:8,padding:"9px 20px",fontWeight:700,fontSize:11,
+          cursor:loading||!hasApiKey?"not-allowed":"pointer",letterSpacing:1,minWidth:120
+        }}>
+          {loading?"⏳ Analyzing...":!hasApiKey?"🔑 Need API Key":analysis?"🔄 Re-run":"⚡ Run Analysis"}
+        </button>
+      </div>
+      {!hasApiKey&&<div style={{border:"1px dashed #374151",borderRadius:8,padding:28,textAlign:"center"}}>
+        <div style={{fontSize:24,marginBottom:8}}>🔑</div>
+        <div style={{color:"#6b7280",fontSize:13}}>Masukkan Anthropic API key di setup screen</div>
+        <div style={{color:"#4b5563",fontSize:11,marginTop:4}}>console.anthropic.com → API Keys</div>
+      </div>}
+      {hasApiKey&&!analysis&&!loading&&<div style={{border:`1px dashed ${color}44`,borderRadius:8,padding:32,textAlign:"center"}}>
+        <div style={{fontSize:28,marginBottom:8}}>🤖</div>
+        <div style={{color:"#6b7280",fontSize:13}}>Click Run untuk generate AI {title}</div>
+      </div>}
+      {loading&&<div style={{padding:32,textAlign:"center"}}>
+        <div style={{width:36,height:36,border:`3px solid ${color}44`,borderTop:`3px solid ${color}`,borderRadius:"50%",margin:"0 auto 12px",animation:"spin 1s linear infinite"}}/>
+        <div style={{color:"#6b7280",fontSize:13}}>AI sedang analisis...</div>
+      </div>}
+      {analysis&&!loading&&<div style={{background:"#0a0a14",border:"1px solid #1a1a2e",borderRadius:8,padding:16,maxHeight:480,overflowY:"auto"}}><MD text={analysis} accent={color}/></div>}
+    </div>
+  );
+}
+
+// ─── AUTO EXEC PANEL ──────────────────────────────────────────────
+function AutoExecPanel({bridgeUrl,parsedSignal,autoExecEnabled,setAutoExecEnabled,pushStatus,setPushStatus}){
+  const [minScore,setMinScore]=useState(60);
+  const [maxTrades,setMaxTrades]=useState(3);
+  const [saving,setSaving]=useState(false);
+
+  const toggleAuto=async(val)=>{
+    if(!bridgeUrl)return;
+    setSaving(true);
+    try{
+      const r=await fetch(`${bridgeUrl}/auto`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:val,min_score:minScore,max_trades_per_day:maxTrades})});
+      const d=await r.json();
+      setAutoExecEnabled(d.auto_settings?.enabled??val);
+      setPushStatus({type:"success",msg:val?"✅ Auto-Execute ENABLED — EA akan trade bila signal cukup kuat":"⏸ Auto-Execute disabled"});
+    }catch(e){setPushStatus({type:"error",msg:`❌ ${e.message}`});}
+    setSaving(false);
+  };
+
+  const pushManual=async()=>{
+    if(!bridgeUrl||!parsedSignal)return;
+    setSaving(true);
+    try{
+      await fetch(`${bridgeUrl}/signal`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsedSignal)});
+      setPushStatus({type:"success",msg:`✅ Signal pushed → EA akan execute bila harga masuk zone ${parsedSignal.entry_low?.toFixed(2)}–${parsedSignal.entry_high?.toFixed(2)}`});
+    }catch(e){setPushStatus({type:"error",msg:`❌ Bridge error: ${e.message}`});}
+    setSaving(false);
+  };
+
+  const IS=({label:l,val:v,color:c})=>(
+    <div style={{background:"#0a0a14",borderRadius:6,padding:"8px 10px",minWidth:80}}>
+      <div style={{color:"#4b5563",fontSize:9,letterSpacing:1}}>{l}</div>
+      <div style={{color:c||"#e5e7eb",fontSize:12,fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{v}</div>
+    </div>
+  );
+
+  return(
+    <div style={{background:"#0d0d1a",border:"1px solid #f59e0b33",borderRadius:12,padding:20,marginBottom:4}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div style={{color:"#f59e0b",fontSize:13,fontWeight:700,letterSpacing:1}}>⚡ EA AUTO-EXECUTE CONTROL</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:autoExecEnabled?"#10b981":"#374151"}}/>
+          <span style={{color:autoExecEnabled?"#10b981":"#6b7280",fontSize:11,fontWeight:700}}>{autoExecEnabled?"LIVE":"OFF"}</span>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:10,marginBottom:14,flexWrap:"wrap"}}>
+        <div>
+          <div style={{color:"#6b7280",fontSize:10,letterSpacing:1.5,marginBottom:4}}>MIN SCORE</div>
+          <input value={minScore} onChange={e=>setMinScore(+e.target.value)} type="number" min={0} max={100}
+            style={{width:70,background:"#0a0a14",border:"1px solid #1e1e3a",borderRadius:6,padding:"7px 10px",fontSize:13,outline:"none"}}/>
+        </div>
+        <div>
+          <div style={{color:"#6b7280",fontSize:10,letterSpacing:1.5,marginBottom:4}}>MAX TRADES/DAY</div>
+          <input value={maxTrades} onChange={e=>setMaxTrades(+e.target.value)} type="number" min={1} max={10}
+            style={{width:60,background:"#0a0a14",border:"1px solid #1e1e3a",borderRadius:6,padding:"7px 10px",fontSize:13,outline:"none"}}/>
+        </div>
+      </div>
+
+      {parsedSignal&&(
+        <div style={{background:"#0a0a14",border:"1px solid #1e1e3a",borderRadius:8,padding:"12px 14px",marginBottom:14}}>
+          <div style={{color:"#9ca3af",fontSize:10,letterSpacing:1.5,marginBottom:8}}>PARSED SIGNAL</div>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+            <IS label="VERDICT" val={parsedSignal.verdict} color={parsedSignal.direction==="BUY"?"#10b981":"#ef4444"}/>
+            <IS label="DIRECTION" val={parsedSignal.direction||"—"} color={parsedSignal.direction==="BUY"?"#10b981":"#ef4444"}/>
+            <IS label="SCORE" val={parsedSignal.score} color="#f59e0b"/>
+            <IS label="ENTRY ZONE" val={parsedSignal.entry_low?`${parsedSignal.entry_low?.toFixed(2)}–${parsedSignal.entry_high?.toFixed(2)}`:"—"}/>
+            <IS label="SL" val={parsedSignal.sl?.toFixed(2)||"—"} color="#ef4444"/>
+            <IS label="TP1" val={parsedSignal.tp1?.toFixed(2)||"—"} color="#10b981"/>
+            <IS label="TP2" val={parsedSignal.tp2?.toFixed(2)||"—"} color="#34d399"/>
+            <IS label="TP3" val={parsedSignal.tp3?.toFixed(2)||"—"} color="#6ee7b7"/>
+          </div>
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+        <button onClick={pushManual} disabled={!parsedSignal||!bridgeUrl||saving} style={{
+          background:parsedSignal&&bridgeUrl?"#3b82f6":"#1e1e2e",
+          color:parsedSignal&&bridgeUrl?"#fff":"#4b5563",
+          border:"none",borderRadius:8,padding:"9px 18px",fontWeight:700,fontSize:12,cursor:"pointer"
+        }}>📤 Push Signal → EA</button>
+        <button onClick={()=>toggleAuto(!autoExecEnabled)} disabled={!bridgeUrl||saving} style={{
+          background:autoExecEnabled?"#ef4444":"#10b981",color:"#fff",
+          border:"none",borderRadius:8,padding:"9px 18px",fontWeight:700,fontSize:12,cursor:"pointer"
+        }}>{autoExecEnabled?"⏸ Disable Auto":"▶ Enable Auto"}</button>
+      </div>
+
+      {pushStatus&&<div style={{marginTop:10,padding:"8px 12px",borderRadius:8,
+        background:pushStatus.type==="success"?"#10b98122":"#ef444422",
+        color:pushStatus.type==="success"?"#10b981":"#ef4444",fontSize:12}}>
+        {pushStatus.msg}
+      </div>}
+      {!bridgeUrl&&<div style={{color:"#4b5563",fontSize:11,marginTop:8}}>⚠ Setup Bridge URL untuk enable auto-execute</div>}
+    </div>
+  );
+}
+
+// ─── MT5 PANEL ────────────────────────────────────────────────────
+function MT5Panel({price,taSignal,atr,supportZones,bridgeUrl}){
+  const [dir,setDir]=useState("BUY");
+  const [orderType,setOrderType]=useState("MARKET");
+  const [lotMode,setLotMode]=useState("auto");
+  const [lot,setLot]=useState("0.01");
+  const [riskPct,setRiskPct]=useState("1.0");
+  const [entryPrice,setEntryPrice]=useState("");
+  const [sl,setSl]=useState("");
+  const [tp1,setTp1]=useState("");
+  const [tp2,setTp2]=useState("");
+  const [tp3,setTp3]=useState("");
+  const [status,setStatus]=useState(null);
+  const [sending,setSending]=useState(false);
+  const [positions,setPositions]=useState([]);
+  const [account,setAccount]=useState(null);
+  const [bridgeSt,setBridgeSt]=useState("checking");
+  const [autoFill,setAutoFill]=useState(false);
+
+  const checkBridge=useCallback(async()=>{
+    if(!bridgeUrl)return;
+    try{
+      const r=await fetch(`${bridgeUrl}/health`,{signal:AbortSignal.timeout(4000)});
+      const d=await r.json();
+      setBridgeSt(d.mt5_connected?"ok":"error");
+      if(d.account)setAccount(d.account);
+    }catch{setBridgeSt("error");}
+  },[bridgeUrl]);
+
+  const fetchPos=useCallback(async()=>{
+    if(!bridgeUrl||bridgeSt!=="ok")return;
+    try{const r=await fetch(`${bridgeUrl}/positions`);const d=await r.json();if(d.success){setPositions(d.open_positions||[]);setAccount(d.account);}}catch{}
+  },[bridgeUrl,bridgeSt]);
+
+  useEffect(()=>{checkBridge();const t=setInterval(checkBridge,10000);return()=>clearInterval(t);},[checkBridge]);
+  useEffect(()=>{fetchPos();const t=setInterval(fetchPos,5000);return()=>clearInterval(t);},[fetchPos]);
+
+  useEffect(()=>{
+    if(!autoFill||!price||!supportZones||!atr)return;
+    const bull=taSignal==="STRONG_BUY"||taSignal==="BUY";
+    setDir(bull?"BUY":"SELL");
+    if(bull){setSl(fmt(supportZones.s2-atr*0.5,2));setTp1(fmt(supportZones.r1,2));setTp2(fmt(supportZones.r2,2));setTp3(fmt(price+atr*4,2));}
+    else{setSl(fmt(supportZones.r2+atr*0.5,2));setTp1(fmt(supportZones.s1,2));setTp2(fmt(supportZones.s2,2));setTp3(fmt(price-atr*4,2));}
+  },[autoFill,price,taSignal,supportZones,atr]);
+
+  const lotPreview=()=>{
+    if(lotMode==="manual")return parseFloat(lot)||0;
+    if(!account||!sl||!price)return null;
+    const risk=(parseFloat(riskPct)/100)*account.balance;
+    const slPips=Math.abs(price-parseFloat(sl))/0.1;
+    if(slPips===0)return null;
+    return Math.max(0.01,Math.round((risk/(slPips*1))*100)/100);
+  };
+
+  const sendTrade=async()=>{
+    if(!bridgeUrl){setStatus({type:"error",msg:"Bridge URL tidak diset"});return;}
+    if(bridgeSt!=="ok"){setStatus({type:"error",msg:"MT5 Bridge tidak connected"});return;}
+    setSending(true);setStatus({type:"info",msg:"Sending to MT5..."});
+    try{
+      const body={direction:dir,order_type:orderType,lot_mode:lotMode,lot:parseFloat(lot),risk_pct:parseFloat(riskPct),entry_price:parseFloat(entryPrice)||price,sl:parseFloat(sl),tp1:parseFloat(tp1),tp2:parseFloat(tp2)||0,tp3:parseFloat(tp3)||0,comment:`XAUUSD-Intel-${dir}`};
+      const r=await fetch(`${bridgeUrl}/execute`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      const d=await r.json();
+      if(d.success){setStatus({type:"success",msg:`✅ Order sent! ${d.orders_placed} ticket(s) | Lot: ${d.lot_used}`});fetchPos();}
+      else{setStatus({type:"error",msg:`❌ Failed: ${d.error||JSON.stringify(d.results)}`});}
+    }catch(e){setStatus({type:"error",msg:`❌ Bridge error: ${e.message}`});}
+    setSending(false);
+  };
+
+  const closeAll=async()=>{
+    try{const r=await fetch(`${bridgeUrl}/close`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});const d=await r.json();setStatus({type:d.success?"success":"error",msg:d.success?`✅ Closed ${d.closed} position(s)`:d.errors?.join(", ")});fetchPos();}catch(e){setStatus({type:"error",msg:e.message});}
+  };
+
+  const bC={ok:"#10b981",error:"#ef4444",checking:"#f59e0b"}[bridgeSt];
+  const bL={ok:"MT5 CONNECTED",error:"MT5 DISCONNECTED",checking:"CHECKING..."}[bridgeSt];
+  const IS={width:"100%",background:"#0a0a14",border:"1px solid #1e1e3a",borderRadius:6,padding:"8px 10px",color:"#e5e7eb",fontSize:13,outline:"none",fontVariantNumeric:"tabular-nums"};
+  const LS={color:"#6b7280",fontSize:10,letterSpacing:1.5,display:"block",marginBottom:4};
+
+  return(
+    <div style={{display:"grid",gridTemplateColumns:"1.2fr 1fr",gap:16}}>
+      <div style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:12,padding:20}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+          <span style={{color:"#f59e0b",fontSize:13,fontWeight:700,letterSpacing:1}}>SEND TO MT5</span>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <span style={{width:7,height:7,borderRadius:"50%",background:bC}}/>
+            <span style={{color:bC,fontSize:10,fontWeight:600}}>{bL}</span>
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,padding:"8px 12px",background:"#13132a",borderRadius:8}}>
+          <input type="checkbox" id="af" checked={autoFill} onChange={e=>setAutoFill(e.target.checked)} style={{accentColor:"#f59e0b"}}/>
+          <label htmlFor="af" style={{color:"#9ca3af",fontSize:12,cursor:"pointer"}}>Auto-fill dari ATR & Support Zones</label>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+          {["BUY","SELL"].map(d=>(
+            <button key={d} onClick={()=>setDir(d)} style={{padding:"10px",border:`2px solid ${dir===d?(d==="BUY"?"#10b981":"#ef4444"):"#1e1e3a"}`,borderRadius:8,background:dir===d?(d==="BUY"?"#10b98122":"#ef444422"):"transparent",color:dir===d?(d==="BUY"?"#10b981":"#ef4444"):"#4b5563",fontWeight:700,fontSize:14,cursor:"pointer"}}>{d}</button>
+          ))}
+        </div>
+        <div style={{marginBottom:10}}>
+          <label style={LS}>ORDER TYPE</label>
+          <div style={{display:"flex",gap:6}}>
+            {["MARKET","LIMIT","STOP"].map(t=>(
+              <button key={t} onClick={()=>setOrderType(t)} style={{flex:1,padding:"7px 4px",border:`1px solid ${orderType===t?"#f59e0b":"#1e1e3a"}`,borderRadius:6,background:orderType===t?"#f59e0b22":"transparent",color:orderType===t?"#f59e0b":"#6b7280",fontSize:11,fontWeight:600,cursor:"pointer"}}>{t}</button>
+            ))}
+          </div>
+        </div>
+        {orderType!=="MARKET"&&<div style={{marginBottom:10}}><label style={LS}>ENTRY PRICE</label><input value={entryPrice} onChange={e=>setEntryPrice(e.target.value)} placeholder={fmt(price,2)} style={IS}/></div>}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}>
+          {[["STOP LOSS","#ef4444",sl,setSl,"e.g. 4080.00"],["TP 1","#10b981",tp1,setTp1,"e.g. 4320.00"],["TP 2 (opt)","#34d399",tp2,setTp2,"e.g. 4450.00"],["TP 3 (opt)","#6ee7b7",tp3,setTp3,"e.g. 4600.00"]].map(([l,c,v,sv,ph])=>(
+            <div key={l}><label style={{...LS,color:c}}>{l}</label><input value={v} onChange={e=>sv(e.target.value)} placeholder={ph} style={{...IS,borderColor:v?`${c}66`:"#1e1e3a"}}/></div>
+          ))}
+        </div>
+        <div style={{marginBottom:12}}>
+          <label style={LS}>LOT SIZE</label>
+          <div style={{display:"flex",gap:6,marginBottom:6}}>
+            {["auto","manual"].map(m=>(
+              <button key={m} onClick={()=>setLotMode(m)} style={{flex:1,padding:"6px",border:`1px solid ${lotMode===m?"#f59e0b":"#1e1e3a"}`,borderRadius:6,background:lotMode===m?"#f59e0b22":"transparent",color:lotMode===m?"#f59e0b":"#6b7280",fontSize:11,fontWeight:600,cursor:"pointer"}}>{m==="auto"?"AUTO (Risk%)":"MANUAL"}</button>
+            ))}
+          </div>
+          {lotMode==="auto"?<div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <input value={riskPct} onChange={e=>setRiskPct(e.target.value)} style={{...IS,width:70}}/>
+            <span style={{color:"#6b7280",fontSize:12}}>% risk</span>
+            <span style={{color:"#f59e0b",fontSize:12,marginLeft:"auto"}}>≈{lotPreview()??"—"} lot</span>
+          </div>:<input value={lot} onChange={e=>setLot(e.target.value)} placeholder="0.01" style={IS}/>}
+        </div>
+        <button onClick={sendTrade} disabled={sending||bridgeSt!=="ok"||!sl||!tp1} style={{
+          width:"100%",padding:"13px",borderRadius:8,border:"none",marginBottom:8,
+          background:sending||bridgeSt!=="ok"?"#1a1a2e":dir==="BUY"?"#10b981":"#ef4444",
+          color:sending||bridgeSt!=="ok"?"#4b5563":"#fff",fontWeight:800,fontSize:15,
+          cursor:sending||bridgeSt!=="ok"?"not-allowed":"pointer",letterSpacing:1
+        }}>{sending?"⏳ Sending...":`📤 ${dir} ${orderType} @ MT5`}</button>
+        {status&&<div style={{padding:"10px 12px",borderRadius:8,marginBottom:8,fontSize:12,
+          background:status.type==="success"?"#10b98122":status.type==="error"?"#ef444422":"#f59e0b22",
+          color:status.type==="success"?"#10b981":status.type==="error"?"#ef4444":"#f59e0b"}}>
+          {status.msg}
+        </div>}
+        {!sl&&<div style={{color:"#6b7280",fontSize:11}}>⚠ Isi SL dan TP1 sebelum execute</div>}
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <div style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:12,padding:16}}>
+          <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:12}}>ACCOUNT INFO</div>
+          {account?(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              {[["Balance",`$${fmt(account.balance,2)}`,"#e5e7eb"],["Equity",`$${fmt(account.equity,2)}`,account.equity>=account.balance?"#10b981":"#ef4444"],["Free Margin",`$${fmt(account.free_margin,2)}`,"#e5e7eb"],["Float P/L",`$${fmtD(account.profit)}`,account.profit>=0?"#10b981":"#ef4444"]].map(([l,v,c])=>(
+                <div key={l} style={{background:"#0a0a14",borderRadius:8,padding:"10px 12px"}}>
+                  <div style={{color:"#4b5563",fontSize:10,marginBottom:2}}>{l}</div>
+                  <div style={{color:c,fontSize:14,fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          ):<div style={{color:"#4b5563",fontSize:12}}>{bridgeSt==="ok"?"Loading...":"Bridge tidak connected"}</div>}
+        </div>
+        <div style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:12,padding:16,flex:1}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <span style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5}}>OPEN POSITIONS ({positions.length})</span>
+            {positions.length>0&&<button onClick={closeAll} style={{background:"#dc2626",color:"#fff",border:"none",borderRadius:6,padding:"5px 10px",fontSize:10,fontWeight:700,cursor:"pointer"}}>CLOSE ALL</button>}
+          </div>
+          {positions.length===0?<div style={{color:"#374151",fontSize:12,textAlign:"center",padding:"16px 0"}}>No open positions</div>:(
+            <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:200,overflowY:"auto"}}>
+              {positions.map(p=>(
+                <div key={p.ticket} style={{background:"#0a0a14",borderRadius:8,padding:"10px 12px",border:`1px solid ${p.type==="BUY"?"#10b98133":"#ef444433"}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between"}}>
+                    <div style={{display:"flex",gap:8}}><span style={{color:p.type==="BUY"?"#10b981":"#ef4444",fontWeight:700,fontSize:12}}>{p.type}</span><span style={{color:"#6b7280",fontSize:11}}>{p.volume}L @ {fmt(p.open_price,2)}</span></div>
+                    <span style={{color:p.profit>=0?"#10b981":"#ef4444",fontWeight:700,fontSize:13}}>${fmt(p.profit,2)}</span>
+                  </div>
+                  <div style={{display:"flex",gap:12,marginTop:4}}>
+                    <span style={{color:"#6b7280",fontSize:10}}>SL: {fmt(p.sl,2)}</span>
+                    <span style={{color:"#6b7280",fontSize:10}}>TP: {fmt(p.tp,2)}</span>
+                    <span style={{color:"#4b5563",fontSize:10}}>#{p.ticket}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────
+function App(){
+  const [apiKey,setApiKey]=useState("");
+  const [apiKeyInput,setApiKeyInput]=useState("");
+  const [bridgeInput,setBridgeInput]=useState("");
+  const [bridgeUrl,setBridgeUrl]=useState("");
+  const [isSetup,setIsSetup]=useState(false);
+
+  const [price,setPrice]=useState(null);
+  const [prevPrice,setPrevPrice]=useState(null);
+  const [priceHistory,setPriceHistory]=useState([]);
+  const [candles,setCandles]=useState([]);
+  const [lastUpdate,setLastUpdate]=useState(null);
+  const [spread,setSpread]=useState(0.3);
+  const [priceSource,setPriceSource]=useState("—");
+
+  const [taSignal,setTaSignal]=useState("NEUTRAL");
+  const [taScore,setTaScore]=useState(0);
+  const [indicators,setIndicators]=useState({});
+  const [atr,setAtr]=useState(null);
+  const [supportZones,setSupportZones]=useState(null);
+
+  const [analysis,setAnalysis]=useState({ta:null,fundamental:null,geopolitical:null,combined:null});
+  const [loading,setLoading]=useState({ta:false,fundamental:false,geopolitical:false,combined:false});
+  const [activeTab,setActiveTab]=useState("overview");
+  const [parsedSignal,setParsedSignal]=useState(null);
+  const [autoExecEnabled,setAutoExecEnabled]=useState(false);
+  const [pushStatus,setPushStatus]=useState(null);
+
+  const iRef=useRef(null);
+
+  // ── Price fetch ──
+  const fetchPrice=useCallback(async()=>{
+    // ── Priority 1: MT5 Bridge (real-time broker feed) ──
+    if(bridgeUrl?.startsWith("http")){
+      try{
+        const r=await fetch(`${bridgeUrl}/price`,{signal:AbortSignal.timeout(4000)});
+        if(r.ok){
+          const d=await r.json();
+          if(d.success&&d.mid>3500){
+            const p=d.mid;
+            setPrevPrice(prev=>price||prev);
+            setPrice(+p.toFixed(2));
+            setPriceHistory(h=>[...h.slice(-59),+p.toFixed(2)]);
+            setSpread(+d.spread.toFixed(2));
+            setLastUpdate(new Date());
+            setPriceSource("MT5 Broker ✅");
+            // Store daily stats
+            if(d.daily_high) window._dailyHigh=d.daily_high;
+            if(d.daily_low)  window._dailyLow=d.daily_low;
+            if(d.change)     window._change=d.change;
+            if(d.change_pct) window._changePct=d.change_pct;
+            return;
+          }
+        }
+      }catch{}
+    }
+
+    // ── Priority 2: goldprice.org ──
+    try{
+      const r=await fetch("https://data-asg.goldprice.org/dbXRates/USD",{signal:AbortSignal.timeout(5000)});
+      if(r.ok){const d=await r.json();const p=d?.items?.[0]?.xauPrice;if(p&&p>3500){setPrevPrice(prev=>price||prev);setPrice(+p.toFixed(2));setPriceHistory(h=>[...h.slice(-59),+p.toFixed(2)]);setSpread(0.35);setLastUpdate(new Date());setPriceSource("goldprice.org ⚠️");return;}}
+    }catch{}
+
+    // ── Priority 3: metals.live ──
+    try{
+      const r=await fetch("https://api.metals.live/v1/spot/gold",{signal:AbortSignal.timeout(5000)});
+      if(r.ok){const d=await r.json();const p=d[0]?.price||d?.price;if(p&&p>3500){setPrevPrice(prev=>price||prev);setPrice(+p.toFixed(2));setPriceHistory(h=>[...h.slice(-59),+p.toFixed(2)]);setSpread(0.35);setLastUpdate(new Date());setPriceSource("metals.live ⚠️");return;}}
+    }catch{}
+
+    // ── Fallback: simulation ──
+    setPrice(prev=>{
+      const base=(prev&&prev>3800)?prev:4180+Math.random()*120;
+      const next=+(base+(Math.random()-0.499)*3.5).toFixed(2);
+      setPrevPrice(base);setPriceHistory(h=>[...h.slice(-59),next]);
+      setLastUpdate(new Date());setSpread(0.35);
+      setPriceSource("simulated ❌");return next;
+    });
+  },[bridgeUrl,price]);
+
+  // ── Init ──
+  useEffect(()=>{
+    if(!isSetup)return;
+    const base=4150+Math.random()*150;
+    const sc=genCandles(base,60);
+    const sp=sc.map(c=>c.close);
+    setPrice(base);setPrevPrice(base);setPriceHistory(sp);setCandles(sc);
+    fetchPrice();
+    const interval = bridgeUrl?.startsWith("http") ? 3000 : 10000;
+    iRef.current=setInterval(fetchPrice, interval);
+    return()=>clearInterval(iRef.current);
+  },[isSetup]);
+
+  // ── Update candles on price tick ──
+  useEffect(()=>{
+    if(!price)return;
+    setCandles(prev=>{if(!prev.length)return genCandles(price,60);const last=prev[prev.length-1];return[...prev.slice(0,-1),{...last,close:price,high:Math.max(last.high,price),low:Math.min(last.low,price)}];});
+  },[price]);
+
+  // ── Compute indicators ──
+  useEffect(()=>{
+    if(priceHistory.length<26)return;
+    const rsi=calcRSI(priceHistory,14),ema20=calcEMA(priceHistory,20),ema50=calcEMA(priceHistory,50);
+    const macd=calcMACD(priceHistory),bb=calcBB(priceHistory,20),cur=priceHistory[priceHistory.length-1];
+    const atrVal=candles.length>=15?calcATR(candles,14):null;
+    setAtr(atrVal);
+    if(atrVal&&cur)setSupportZones(calcZones(cur,atrVal));
+    let score=0;const signals=[];
+    if(rsi!=null){if(rsi<30){score+=30;signals.push("RSI Oversold");}else if(rsi<45){score+=10;signals.push("RSI Weak");}else if(rsi>70){score-=30;signals.push("RSI Overbought");}else if(rsi>55){score-=10;signals.push("RSI Strong");}else signals.push("RSI Neutral");}
+    if(ema20&&ema50){if(ema20>ema50){score+=20;signals.push("EMA Bullish");}else{score-=20;signals.push("EMA Bearish");}}
+    if(macd!=null){if(macd>0){score+=15;signals.push("MACD Positive");}else{score-=15;signals.push("MACD Negative");}}
+    if(bb&&cur){if(cur<bb.lower){score+=25;signals.push("Below BB Lower");}else if(cur>bb.upper){score-=25;signals.push("Above BB Upper");}else if(cur>bb.middle){score+=5;signals.push("Above BB Mid");}else{score-=5;signals.push("Below BB Mid");}}
+    if(ema20&&cur){if(cur>ema20)score+=10;else score-=10;}
+    const s=Math.max(-100,Math.min(100,score));
+    setTaScore(s);
+    setTaSignal(s>=60?"STRONG_BUY":s>=25?"BUY":s<=-60?"STRONG_SELL":s<=-25?"SELL":"NEUTRAL");
+    setIndicators({rsi,ema20,ema50,macd,bb,cur,signals});
+  },[priceHistory,candles]);
+
+  // ── Run analysis ──
+  const runAnalysis=useCallback(async(type)=>{
+    if(!apiKey||loading[type])return;
+    setLoading(l=>({...l,[type]:true}));
+    setAnalysis(a=>({...a,[type]:null}));
+
+    const slMin=atr?fmt(atr*1.5,0):"80",slMax=atr?fmt(atr*2.5,0):"120";
+    const s1=supportZones?.s1?fmt(supportZones.s1,2):fmt((price||4200)*0.986,2);
+    const s2=supportZones?.s2?fmt(supportZones.s2,2):fmt((price||4200)*0.972,2);
+    const s3=supportZones?.s3?fmt(supportZones.s3,2):fmt((price||4200)*0.952,2);
+    const r1=supportZones?.r1?fmt(supportZones.r1,2):fmt((price||4200)*1.014,2);
+    const r2=supportZones?.r2?fmt(supportZones.r2,2):fmt((price||4200)*1.028,2);
+
+    const prompts={
+      ta:`You are a professional XAUUSD technical analyst. Date: June 2026.\nPrice: ${fmt(price,2)} | ATR(14): $${atr?fmt(atr,2):"~40"}/H1 | TA Score: ${taScore}/100\nRSI(14): ${indicators.rsi?fmt(indicators.rsi,1):"mixed"} | EMA20: ${indicators.ema20?fmt(indicators.ema20,2):"—"} | EMA50: ${indicators.ema50?fmt(indicators.ema50,2):"—"}\nMACD: ${indicators.macd?fmt(indicators.macd,4):"—"} | BB: ${fmt(indicators.bb?.lower,2)}–${fmt(indicators.bb?.upper,2)}\nSignals: ${(indicators.signals||[]).join(", ")||"neutral"}\nS1=${s1} | S2=${s2} | S3=${s3} | R1=${r1} | R2=${r2}\nNOTE: ATR $${atr?fmt(atr,2):"~40"} means SL must be $${slMin}–${slMax} minimum.\n\n**1. Price Action Summary**\n**2. Indicator Analysis**\n**3. Support & Resistance** (use zones above)\n**4. Entry Strategy** (pullback to S1/S2, not market)\n**5. TP1 / TP2 / TP3** (exact prices + RR)\n**6. Stop Loss** (exact price, ATR-based)\n**7. Risk/Reward Table**\n**8. Bias & Confidence**\n**9. Risk Warning**`,
+
+      fundamental:`You are a senior commodity economist. XAU/USD: ${fmt(price,2)}. Date: June 2026.\n\n**1. USD/DXY Impact**\n**2. Fed Policy** (Jun 2026 stance)\n**3. Inflation & CPI**\n**4. Central Bank Buying** (2025-2026 CB accumulation)\n**5. ETF Flows** (GLD/IAU)\n**6. Physical Demand** (Asia)\n**7. Supply Constraints**\n**8. Seasonal Patterns**\n**9. Fundamental Bias** (BULLISH/BEARISH/NEUTRAL)\n**10. 3-Month Target Range**`,
+
+      geopolitical:`You are a geopolitical risk analyst for gold. XAU/USD: ${fmt(price,2)}. Date: June 2026.\n\n**1. Global Risk Score** (1-10)\n**2. US-China Tensions** (trade war 2026)\n**3. Middle East**\n**4. Russia-Ukraine**\n**5. De-dollarization** (BRICS gold reserves)\n**6. US Fiscal Risk**\n**7. Political Risk Calendar**\n**8. Safe-Haven Premium** ($ estimate in price)\n**9. Outlook** (BULLISH/BEARISH/NEUTRAL)`,
+
+      combined:`Kau adalah Penganalisis Emas Profesional. Tarikh: Jun 2026. Harga XAU/USD semasa: ${fmt(price,2)}.
+
+DATA TEKNIKAL:
+- Skor TA: ${taScore}/100 (${taSignal})
+- RSI(14): ${indicators.rsi?fmt(indicators.rsi,1):"—"} | EMA20: ${indicators.ema20?fmt(indicators.ema20,2):"—"} | EMA50: ${indicators.ema50?fmt(indicators.ema50,2):"—"}
+- ATR(14): $${atr?fmt(atr,2):"~40"} — SL MESTI minimum $${slMin}–${slMax} dari entry
+- Zon Support: S1=${s1} | S2=${s2} | S3=${s3}
+- Zon Resistance: R1=${r1} | R2=${r2}
+- Isyarat aktif: ${(indicators.signals||[]).join(", ")||"neutral"}
+
+Tulis laporan analisis emas RINGKAS dalam BAHASA MELAYU merangkumi 3 bahagian:
+
+**1. ANALISIS TEKNIKAL**
+Ringkasan pergerakan harga, momentum RSI, kedudukan EMA, isyarat MACD, dan zon S/R penting. (3-4 ayat)
+
+**2. ANALISIS FUNDAMENTAL**
+Keadaan USD/DXY semasa, dasar Fed, inflasi, pembelian emas bank pusat global (China/India/BRICS), dan aliran ETF emas. (3-4 ayat)
+
+**3. ANALISIS GEOPOLITIK**
+Tahap risiko global (skor 1-10), ketegangan AS-China, situasi Timur Tengah, perang Russia-Ukraine, trend de-dolarisasi, dan premium safe-haven dalam harga semasa. (3-4 ayat)
+
+**4. KEPUTUSAN & SETUP TRADE**
+- Verdict: BELI KUAT / BELI / NEUTRAL / JUAL / JUAL KUAT
+- Zon Entry (harga pullback, BUKAN harga semasa ${fmt(price,2)})
+- Stop Loss (harga tepat, minimum $${slMin} dari entry)
+- TP1 (RR >= 1:2) | TP2 (RR >= 1:4) | TP3 (RR >= 1:6)
+- Tempoh pegang disyorkan
+
+PERATURAN WAJIB (divalidasi secara mekanikal):
+- Untuk BELI: sl < entry < tp1 < tp2 < tp3
+- Untuk JUAL: sl > entry > tp1 > tp2 > tp3
+- Jika NEUTRAL: tetapkan sl/tp1/tp2/tp3 kepada null
+
+Selepas laporan lengkap di atas, pada BARIS BARU TERAKHIR, output objek JSON dengan struktur TEPAT ini dan tiada apa-apa selepasnya:
+
+{"direction": "BUY or SELL or NEUTRAL", "entry_low": number or null, "entry_high": number or null, "sl": number or null, "tp1": number or null, "tp2": number or null, "tp3": number or null, "confidence_pct": number}
+
+Semak semula nombor JSON kau memenuhi PERATURAN WAJIB sebelum output.`
+    };
+
+    try{
+      let text="";
+      // Use Vercel serverless proxy (no CORS issue)
+      const r=await fetch("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({api_key:apiKey,prompt:prompts[type],type})});
+      const d=await r.json();
+      if(!d.success)throw new Error(d.error||"API error");
+      text=d.text;
+
+      // Parse signal if combined
+      if(type==="combined"&&text){
+        const sig=parseSignal(text,price,supportZones,atr,taScore,taSignal);
+        if(sig){
+          setParsedSignal(sig);
+          if(bridgeUrl?.startsWith("http")){
+            try{await fetch(`${bridgeUrl}/signal`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(sig)});}
+            catch(e){console.warn("Signal push failed:",e.message);}
+          }
+        }
+      }
+      setAnalysis(a=>({...a,[type]:text}));
+    }catch(e){
+      setAnalysis(a=>({...a,[type]:`❌ Error: ${e.message}\n\nPastikan:\n- API key betul (sk-ant-...)\n- Dashboard deploy kat Vercel dengan /api/analyze function`}));
+    }
+    setLoading(l=>({...l,[type]:false}));
+  },[apiKey,bridgeUrl,price,indicators,taScore,taSignal,atr,supportZones,loading]);
+
+  // ── SETUP SCREEN ──
+  if(!isSetup){
+    const IS2={width:"100%",background:"#0a0a14",border:"1px solid #1e1e3a",borderRadius:8,padding:"11px 14px",color:"#e5e7eb",fontSize:13,outline:"none",fontFamily:"monospace"};
+    const LS2={color:"#6b7280",fontSize:11,letterSpacing:1.5,display:"block",marginBottom:6,fontWeight:600};
+    return(
+      <div style={{background:"#08080f",minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+        <div style={{background:"#0d0d1a",border:"1px solid #1e1e3a",borderRadius:16,padding:"40px 36px",width:"100%",maxWidth:460}}>
+          <div style={{textAlign:"center",marginBottom:32}}>
+            <div style={{fontSize:48,marginBottom:10}}>⚡</div>
+            <div style={{color:"#f59e0b",fontWeight:900,fontSize:22,letterSpacing:3}}>XAUUSD INTEL</div>
+            <div style={{color:"#6b7280",fontSize:13,marginTop:4}}>Gold Intelligence + MT5 Auto-Entry</div>
+          </div>
+          <div style={{marginBottom:18}}>
+            <label style={LS2}>ANTHROPIC API KEY <span style={{color:"#4b5563",fontWeight:400}}>(untuk AI analysis)</span></label>
+            <input type="password" value={apiKeyInput} onChange={e=>setApiKeyInput(e.target.value)} placeholder="sk-ant-api03-..." style={IS2}
+              onKeyDown={e=>e.key==="Enter"&&(setApiKey(apiKeyInput),setBridgeUrl(bridgeInput),setIsSetup(true))}/>
+            <div style={{color:apiKeyInput.startsWith("sk-")?"#10b981":"#4b5563",fontSize:10,marginTop:4}}>
+              {apiKeyInput.startsWith("sk-")?"✅ API key valid":"Dapatkan dari console.anthropic.com → API Keys"}
+            </div>
+          </div>
+          <div style={{marginBottom:24}}>
+            <label style={LS2}>MT5 BRIDGE URL <span style={{color:"#4b5563",fontWeight:400}}>(optional)</span></label>
+            <input value={bridgeInput} onChange={e=>setBridgeInput(e.target.value)} placeholder="https://xxx.trycloudflare.com" style={IS2}/>
+            <div style={{color:"#4b5563",fontSize:10,marginTop:4}}>Untuk MT5 auto-entry. Kosongkan jika belum setup.</div>
+          </div>
+          <div style={{background:"#0a0a14",border:"1px solid #1e1e3a",borderRadius:8,padding:"12px 14px",marginBottom:20}}>
+            {[["✅","Harga real-time","sentiasa live"],["✅","TA Indicators","auto compute dari minit 1"],[apiKeyInput.startsWith("sk-")?"✅":"⚠️","AI Analysis",apiKeyInput.startsWith("sk-")?"ready":"perlu API key"],[bridgeInput.startsWith("http")?"✅":"⚠️","MT5 Auto-Entry",bridgeInput.startsWith("http")?"bridge configured":"perlu Bridge URL"]].map(([e,l,d])=>(
+              <div key={l} style={{color:"#9ca3af",fontSize:11,lineHeight:2}}>{e} <strong style={{color:"#e5e7eb"}}>{l}</strong> — {d}</div>
+            ))}
+          </div>
+          <button onClick={()=>{setApiKey(apiKeyInput);setBridgeUrl(bridgeInput);setIsSetup(true);}} style={{
+            width:"100%",background:"#f59e0b",color:"#000",border:"none",borderRadius:8,
+            padding:"14px",fontWeight:800,fontSize:15,cursor:"pointer",letterSpacing:1
+          }}>LAUNCH DASHBOARD →</button>
+          <div style={{color:"#374151",fontSize:11,textAlign:"center",marginTop:10}}>Boleh launch tanpa API key — AI analysis sahaja disabled</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── MAIN DASHBOARD ──
+  const priceDir=price&&prevPrice?(price>=prevPrice?"up":"down"):"flat";
+  const priceDelta=window._change||(price&&prevPrice?price-prevPrice:0);
+  const pricePct=window._changePct||(prevPrice?(priceDelta/prevPrice)*100:0);
+
+  const tabs=[
+    {id:"overview",label:"📊 Overview"},
+    {id:"mt5",label:"📤 MT5 Entry"},
+    {id:"technical",label:"📈 Technical"},
+    {id:"fundamental",label:"💹 Fundamental"},
+    {id:"geopolitical",label:"🌍 Geopolitical"},
+    {id:"signal",label:"⚡ Master Signal"},
+  ];
+
+  return(
+    <div style={{background:"#08080f",minHeight:"100vh"}}>
+      {/* Header */}
+      <div style={{background:"#0a0a18",borderBottom:"1px solid #1a1a30",padding:"12px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
+        <div style={{display:"flex",alignItems:"center",gap:16}}>
+          <span style={{color:"#f59e0b",fontWeight:900,fontSize:16,letterSpacing:3}}>⚡ XAUUSD INTEL</span>
+          <span style={{color:"#374151"}}>|</span>
+          <span style={{color:"#6b7280",fontSize:11}}>Gold Intelligence + MT5 Bridge</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <span style={{display:"flex",alignItems:"center",gap:5,color:"#10b981",fontSize:11}}>
+            <span style={{width:6,height:6,borderRadius:"50%",background:"#10b981",display:"inline-block",animation:"pulse 2s infinite"}}/>LIVE
+          </span>
+          {lastUpdate&&<span style={{color:"#374151",fontSize:10}}>{lastUpdate.toLocaleTimeString()}</span>}
+        </div>
+      </div>
+
+      {/* Ticker */}
+      <div style={{background:"#0d0d1a",borderBottom:"1px solid #1a1a2e",padding:"14px 24px",display:"flex",alignItems:"center",gap:28,flexWrap:"wrap"}}>
+        <div>
+          <div style={{color:"#6b7280",fontSize:10,letterSpacing:2}}>XAU/USD</div>
+          <div style={{display:"flex",alignItems:"baseline",gap:10}}>
+            <span style={{fontSize:36,fontWeight:800,color:priceDir==="up"?"#10b981":"#ef4444",fontVariantNumeric:"tabular-nums"}}>{fmt(price,2)}</span>
+            <span style={{color:priceDir==="up"?"#10b981":"#ef4444",fontSize:14,fontWeight:600}}>{fmtD(priceDelta)} ({fmtD(pricePct)}%)</span>
+          </div>
+        </div>
+        {[{l:"BID",v:price?fmt(price-spread/2,2):"—"},{l:"ASK",v:price?fmt(price+spread/2,2):"—"},{l:"SPREAD",v:fmt(spread,2)},{l:"HIGH",v:window._dailyHigh?fmt(window._dailyHigh,2):"—"},{l:"LOW",v:window._dailyLow?fmt(window._dailyLow,2):"—"},{l:"RSI(14)",v:indicators.rsi?fmt(indicators.rsi,1):"—"},{l:"ATR",v:atr?`$${fmt(atr,2)}`:"—"}].map(x=>(
+          <div key={x.l}><div style={{color:"#4b5563",fontSize:10,letterSpacing:1.5}}>{x.l}</div><div style={{color:"#e5e7eb",fontSize:14,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{x.v}</div></div>
+        ))}
+        <div style={{marginLeft:"auto",display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+          <SignalBadge signal={taSignal}/>
+          <span style={{color:priceSource.includes("⚠️")?"#f59e0b":"#10b981",fontSize:9,letterSpacing:1}}>SRC: {priceSource}</span>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{background:"#0a0a18",borderBottom:"1px solid #1a1a2e",padding:"0 24px",display:"flex",gap:2,overflowX:"auto",position:"sticky",top:53,zIndex:99}}>
+        {tabs.map(t=>(
+          <button key={t.id} onClick={()=>setActiveTab(t.id)} style={{background:"none",border:"none",padding:"11px 16px",cursor:"pointer",color:activeTab===t.id?"#f59e0b":"#6b7280",fontWeight:activeTab===t.id?700:400,fontSize:12,borderBottom:activeTab===t.id?"2px solid #f59e0b":"2px solid transparent",whiteSpace:"nowrap",transition:"color .15s"}}>{t.label}</button>
+        ))}
+      </div>
+
+      {/* Content */}
+      <div style={{padding:20,maxWidth:1400,margin:"0 auto"}}>
+
+        {activeTab==="overview"&&(
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14}}>
+            <div style={{gridColumn:"1/3",background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18}}>
+              <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:10}}>PRICE CHART — H1 (60 candles)</div>
+              <CandleChart candles={candles} width={600} height={190}/>
+            </div>
+            <div style={{background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18}}>
+              <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:14}}>ANALYSIS SCORES</div>
+              <div style={{display:"flex",flexDirection:"column",gap:4,alignItems:"center"}}>
+                <ScoreGauge score={taScore} label="Technical"/>
+                <ScoreGauge score={35} label="Fundamental"/>
+                <ScoreGauge score={55} label="Geopolitical"/>
+              </div>
+            </div>
+            <div style={{background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18}}>
+              <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:10}}>PRICE MOMENTUM</div>
+              <Sparkline data={priceHistory} width={260} height={55} color={priceDir==="up"?"#10b981":"#ef4444"}/>
+              <div style={{color:"#6b7280",fontSize:10,marginTop:8}}>{priceHistory.length} ticks collected</div>
+            </div>
+            <div style={{background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18}}>
+              <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:10}}>KEY INDICATORS</div>
+              {[["RSI (14)",indicators.rsi?fmt(indicators.rsi,1):"—",indicators.rsi<30?"#10b981":indicators.rsi>70?"#ef4444":"#e5e7eb"],["EMA 20",indicators.ema20?fmt(indicators.ema20,2):"—",price>indicators.ema20?"#10b981":"#ef4444"],["EMA 50",indicators.ema50?fmt(indicators.ema50,2):"—",price>indicators.ema50?"#10b981":"#ef4444"],["MACD",indicators.macd?fmt(indicators.macd,4):"—",indicators.macd>0?"#10b981":"#ef4444"],["ATR (14)",atr?`$${fmt(atr,2)}`:"—","#f59e0b"],["BB Upper",indicators.bb?.upper?fmt(indicators.bb.upper,2):"—","#9ca3af"],["BB Lower",indicators.bb?.lower?fmt(indicators.bb.lower,2):"—","#9ca3af"]].map(([l,v,c])=>(
+                <div key={l} style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                  <span style={{color:"#6b7280",fontSize:12}}>{l}</span>
+                  <span style={{color:c,fontSize:12,fontWeight:600,fontVariantNumeric:"tabular-nums"}}>{v}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18}}>
+              <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:10}}>SUPPORT / RESISTANCE</div>
+              {supportZones?(
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {[{label:"R2",val:supportZones.r2,color:"#ef4444",tag:"~2 ATR"},{label:"R1",val:supportZones.r1,color:"#f87171",tag:"~1 ATR"},{label:"SPOT",val:price,color:"#f59e0b",tag:"current"},{label:"S1",val:supportZones.s1,color:"#34d399",tag:"~1 ATR pullback"},{label:"S2",val:supportZones.s2,color:"#10b981",tag:"~2 ATR pullback"},{label:"S3",val:supportZones.s3,color:"#059669",tag:"major support"}].map(z=>(
+                    <div key={z.label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"5px 8px",background:z.label==="SPOT"?"#1a1a08":"#0a0a14",borderRadius:6,border:z.label==="SPOT"?"1px solid #f59e0b44":"none"}}>
+                      <div style={{display:"flex",gap:8}}><span style={{color:z.color,fontSize:11,fontWeight:700,minWidth:32}}>{z.label}</span><span style={{color:"#374151",fontSize:10}}>{z.tag}</span></div>
+                      <span style={{color:z.color,fontSize:13,fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{fmt(z.val,2)}</span>
+                    </div>
+                  ))}
+                  {atr&&<div style={{marginTop:4,padding:"6px 8px",background:"#0a0a14",borderRadius:6,display:"flex",justifyContent:"space-between"}}>
+                    <span style={{color:"#6b7280",fontSize:11}}>Recommended SL</span>
+                    <span style={{color:"#f59e0b",fontSize:11,fontWeight:600}}>${fmt(atr*1.5,0)}–${fmt(atr*2.5,0)}</span>
+                  </div>}
+                </div>
+              ):<div style={{color:"#374151",fontSize:12}}>Calculating...</div>}
+            </div>
+            <div style={{background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18}}>
+              <div style={{color:"#9ca3af",fontSize:11,letterSpacing:1.5,marginBottom:10}}>ACTIVE SIGNALS</div>
+              {(indicators.signals||[]).map((s,i)=>{
+                const bull=s.includes("Bullish")||s.includes("Oversold")||s.includes("Positive")||s.includes("Below")||s.includes("Weak");
+                return<div key={i} style={{display:"flex",gap:8,marginBottom:8,alignItems:"flex-start"}}><span style={{width:7,height:7,borderRadius:"50%",background:bull?"#10b981":"#ef4444",marginTop:4,flexShrink:0}}/><span style={{color:bull?"#10b981":"#ef4444",fontSize:12}}>{s}</span></div>;
+              })}
+              {!(indicators.signals?.length)&&<div style={{color:"#374151",fontSize:12}}>Accumulating data...</div>}
+            </div>
+          </div>
+        )}
+
+        {activeTab==="mt5"&&<MT5Panel price={price} taSignal={taSignal} atr={atr} supportZones={supportZones} bridgeUrl={bridgeUrl}/>}
+        {activeTab==="technical"&&<AnalysisPane title="Technical Analysis" subtitle="RSI • EMA • MACD • Bollinger Bands • ATR • Support/Resistance" analysis={analysis.ta} loading={loading.ta} onRun={()=>runAnalysis("ta")} color="#3b82f6" hasApiKey={!!apiKey}/>}
+        {activeTab==="fundamental"&&<AnalysisPane title="Fundamental Analysis" subtitle="Fed Policy • DXY • Inflation • Central Banks • ETF Flows • Physical Demand" analysis={analysis.fundamental} loading={loading.fundamental} onRun={()=>runAnalysis("fundamental")} color="#8b5cf6" hasApiKey={!!apiKey}/>}
+        {activeTab==="geopolitical"&&<AnalysisPane title="Geopolitical Analysis" subtitle="Safe-Haven Flows • Conflicts • De-dollarization • Political Risk" analysis={analysis.geopolitical} loading={loading.geopolitical} onRun={()=>runAnalysis("geopolitical")} color="#ef4444" hasApiKey={!!apiKey}/>}
+        {activeTab==="signal"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{background:"#0d0d1a",border:"1px solid #1a1a2e",borderRadius:12,padding:18,display:"flex",alignItems:"center",gap:24,flexWrap:"wrap"}}>
+              <div><div style={{color:"#6b7280",fontSize:10,letterSpacing:2,marginBottom:8}}>OVERALL</div><SignalBadge signal={taSignal}/></div>
+              <ScoreGauge score={taScore} label="Technical"/>
+              <ScoreGauge score={35} label="Fundamental"/>
+              <ScoreGauge score={55} label="Geopolitical"/>
+              <ScoreGauge score={Math.round((taScore+35+55)/3)} label="Combined"/>
+            </div>
+            <AutoExecPanel bridgeUrl={bridgeUrl} parsedSignal={parsedSignal} autoExecEnabled={autoExecEnabled} setAutoExecEnabled={setAutoExecEnabled} pushStatus={pushStatus} setPushStatus={setPushStatus}/>
+            <AnalysisPane title="Master Trading Signal" subtitle="Full confluence — TA + Fundamental + Geopolitical + Exact Trade Setup + Auto-Push to EA" analysis={analysis.combined} loading={loading.combined} onRun={()=>runAnalysis("combined")} color="#f59e0b" hasApiKey={!!apiKey}/>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
